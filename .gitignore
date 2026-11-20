@@ -3,3 +3,7 @@ logs/
 .env
 __pycache__/
 config/airflow.cfg
+
+data/staging/
+data/clean/*.csv
+data/rejected/*.csv
