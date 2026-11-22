@@ -60,17 +60,39 @@ def _lire_csv(chemin):
         return list(lecteur.fieldnames), list(lecteur)
 
 
+# --- 0. periode a traiter -------------------------------------------------
+def choisir_mois(params=None, data_interval_start=None):
+    """Retourne le mois a traiter, au format 'AAAA-MM'.
+
+    Priorite : le parametre 'mois' choisi a la main, sinon le debut de la
+    periode planifiee (cas du backfill et des executions automatiques).
+    """
+    mois = ((params or {}).get("mois") or "").strip()
+    if not mois and data_interval_start is not None:
+        mois = data_interval_start.strftime("%Y-%m")
+    if not mois:
+        raise ValueError("Aucun mois a traiter : renseigner le parametre 'mois' (ex. 2022-03)")
+    datetime.strptime(mois, "%Y-%m")  # leve une erreur si le format est faux
+    log.info("periode : mois a traiter = %s", mois)
+    return mois
+
+
 # --- 1. extract -----------------------------------------------------------
 def extract(mois=None):
-    """Lit le CSV brut (tout, ou un seul mois 'YYYY-MM') et l'ecrit en staging."""
-    log.info("extract : debut (mois=%s)", mois or "tous")
+    """Lit le CSV brut (tout, ou un seul mois 'YYYY-MM') et l'ecrit en staging.
+
+    Chaque mois a son propre dossier de staging : deux mois peuvent donc
+    etre traites en meme temps sans se marcher dessus.
+    """
+    etiquette = mois or "tous"
+    log.info("extract : debut (mois=%s)", etiquette)
     colonnes, lignes = _lire_csv(RAW_FILE)
     if mois:
         lignes = [l for l in lignes if l["Timestamp"].startswith(mois)]
-    chemin = os.path.join(STAGING_DIR, "extracted.csv")
+    chemin = os.path.join(STAGING_DIR, etiquette, "extracted.csv")
     _ecrire_csv(chemin, colonnes, lignes)
     log.info("extract : %s lignes ecrites dans %s", len(lignes), chemin)
-    return {"path": chemin, "nb_lignes": len(lignes)}
+    return {"mois": etiquette, "path": chemin, "nb_lignes": len(lignes)}
 
 
 # --- 2. validate ------------------------------------------------------------
@@ -112,19 +134,31 @@ def validate(info):
             rejetees.append({**l, "motif": motif})
         else:
             valides.append(l)
-    chemin_ok = os.path.join(STAGING_DIR, "valid.csv")
-    chemin_ko = os.path.join(REJECTED_DIR, "rejected.csv")
+    chemin_ok = os.path.join(os.path.dirname(info["path"]), "valid.csv")
+    chemin_ko = os.path.join(REJECTED_DIR, f"rejected_{info['mois']}.csv")
     _ecrire_csv(chemin_ok, COLONNES, valides)
     _ecrire_csv(chemin_ko, COLONNES + ["motif"], rejetees)
     log.info("validate : %s valides, %s rejetees", len(valides), len(rejetees))
     if lignes and len(rejetees) / len(lignes) > SEUIL_REJET:
         raise ValueError(f"Trop de lignes rejetees : {len(rejetees)}/{len(lignes)}")
-    return {"path": chemin_ok, "valides": len(valides), "rejetees": len(rejetees)}
+    return {"mois": info["mois"], "path": chemin_ok, "valides": len(valides), "rejetees": len(rejetees)}
 
 
 # --- 3. transform -----------------------------------------------------------
 SEL_GRAVITE = {"Low": 1, "Medium": 2, "High": 3}
 SEL_HASH = "dataops-2026"  # sel ajoute avant le hachage des noms
+
+
+COLONNES_SORTIE = [
+    "timestamp", "date", "mois", "heure", "jour_semaine", "source_ip",
+    "destination_ip", "source_port", "destination_port", "protocol",
+    "packet_length", "packet_type", "traffic_type", "payload_data",
+    "anomaly_score", "attack_type", "attack_signature", "action_taken",
+    "severity_level", "severity_score", "user_hash", "device_info",
+    "network_segment", "ville", "etat", "proxy_ip", "log_source",
+    "has_malware", "has_alert", "has_proxy", "has_firewall_log",
+    "has_ids_alert", "nb_indicateurs",
+]
 
 
 def _pseudonymiser(nom):
@@ -181,12 +215,12 @@ def transform(info):
             continue
         vus.add(cle)
         sortie.append(_transformer_ligne(l))
-    colonnes_sortie = list(sortie[0].keys()) if sortie else []
-    chemin = os.path.join(STAGING_DIR, "transformed.csv")
-    _ecrire_csv(chemin, colonnes_sortie, sortie)
+    chemin = os.path.join(os.path.dirname(info["path"]), "transformed.csv")
+    _ecrire_csv(chemin, COLONNES_SORTIE, sortie)
     log.info("transform : %s lignes (%s doublons retires), %s colonnes en sortie",
-             len(sortie), len(lignes) - len(sortie), len(colonnes_sortie))
-    return {"path": chemin, "nb_lignes": len(sortie), "nb_colonnes": len(colonnes_sortie)}
+             len(sortie), len(lignes) - len(sortie), len(COLONNES_SORTIE))
+    return {"mois": info["mois"], "path": chemin, "nb_lignes": len(sortie),
+            "nb_colonnes": len(COLONNES_SORTIE)}
 
 
 # --- 4. load ----------------------------------------------------------------
@@ -200,5 +234,7 @@ def load(info):
         chemin = os.path.join(CLEAN_DIR, f"attacks_{mois}.csv")
         _ecrire_csv(chemin, colonnes, groupe)
         log.info("load : %s -> %s lignes", chemin, len(groupe))
+    if not par_mois:
+        log.warning("load : aucune ligne pour %s, rien a ecrire", info["mois"])
     log.info("load : %s mois ecrits, %s lignes au total", len(par_mois), len(lignes))
     return {m: len(g) for m, g in sorted(par_mois.items())}
